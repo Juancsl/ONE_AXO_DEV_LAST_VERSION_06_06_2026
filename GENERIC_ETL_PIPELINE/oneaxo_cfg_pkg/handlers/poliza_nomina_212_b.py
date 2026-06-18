@@ -529,7 +529,7 @@ class PolizaNomina212BHandler:
             + new_idext.ljust(18)[:18]
             + "NETO".ljust(50)[:50]
             + first_cost_center.ljust(10)[:10]
-            + line[119:]
+            ##+ line[119:]
         )
 
     def _parse_decimal_amount(self, value: str) -> Decimal:
