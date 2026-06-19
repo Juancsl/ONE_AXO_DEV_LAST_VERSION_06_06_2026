@@ -24,7 +24,7 @@ POSTGRES_CONN_ID_DEFAULT = "gobierno_central_postgres"
 #   - No se rechaza si un grupo supera este número.
 #   - Se divide en N documentos.
 #   - Cada documento tiene 1 Header + máximo N detalles.
-#   - Cada documento renumera sus detalles desde 001.
+#   - Cada documento renumera sus detalles desde 1 usando espacios a la izquierda (no ceros).
 # ============================================================================
 MAX_DETAILS_PER_DOCUMENT = 999
 
@@ -411,11 +411,11 @@ class PolizaNomina212BHandler:
 
     def _rebuild_header(self, header_line: str, detail_count: int, new_idext: str) -> str:
         line = self._replace_idext(header_line, new_idext)
-        return line[:13] + str(detail_count).zfill(3) + line[16:]
+        return line[:13] + str(detail_count).rjust(3) + line[16:]
 
     def _renumber_detail(self, detail_line: str, number: int, new_idext: str) -> str:
         line = self._replace_idext(detail_line, new_idext)
-        return line[:13] + str(number).zfill(3) + line[16:]
+        return line[:13] + str(number).rjust(3) + line[16:]
 
     def _build_split_txt(
         self,
@@ -516,7 +516,7 @@ class PolizaNomina212BHandler:
             - Costcenter: el de la primera línea del archivo/grupo generado
         """
         line = self._replace_idext(template_detail_line, new_idext)
-        line = line[:13] + str(number).zfill(3) + line[16:]
+        line = line[:13] + str(number).rjust(3) + line[16:]
 
         amount_text = self._format_amount(amount)
         first_cost_center = template_detail_line[109:119].strip()
