@@ -46,6 +46,9 @@ class PolizaNomina212BHandler:
         raw_job = raw_job or {}
         global_context = global_context or {}
 
+        # IMPORTANTE:
+        # Usar primero la conexión que manda el DAG genérico.
+        # Si no, el handler puede caer al default y apuntar a otra BD.
         postgres_conn_id = (
             global_context.get("postgres_conn_id")
             or integration_config.get("postgres_conn_id")
@@ -104,16 +107,6 @@ class PolizaNomina212BHandler:
         route = "S4H" if society_flag == "1" else "ECC"
         trans_uuid = str(uuid.uuid4())
 
-        neto_detail_lines = [
-            line for line in detail_lines
-            if self._is_neto_detail(line)
-        ]
-
-        # Cuenta contable del NETO principal del archivo original.
-        # Los TXT split deben generar su propio importe NETO, pero conservar
-        # la cuenta NETO que venía en el archivo de entrada.
-        original_neto_glaccount = self._extract_original_neto_glaccount(neto_detail_lines)
-
         non_neto_detail_lines = [
             line for line in detail_lines
             if not self._is_neto_detail(line)
@@ -168,7 +161,6 @@ class PolizaNomina212BHandler:
                     header_line=header_line,
                     detail_lines=chunk_details,
                     new_idext=document_idext,
-                    neto_glaccount=original_neto_glaccount,
                 )
                 split_source_file = self._build_split_filename(
                     source_file=source_file,
@@ -187,6 +179,8 @@ class PolizaNomina212BHandler:
                     source_file=split_source_file,
                     sociedad=sociedad,
                     trans_uuid=trans_uuid,
+                    postgres_conn_id=postgres_conn_id,
+                    apply_lookups=(route == "S4H"),
                 )
 
                 documents.append(
@@ -237,7 +231,6 @@ class PolizaNomina212BHandler:
             "line_count": len(lines),
             "original_detail_count": len(detail_lines),
             "ignored_input_neto_count": ignored_input_neto_count,
-            "original_neto_glaccount": original_neto_glaccount,
             "max_details_per_document": max_details_per_document,
             "documents": documents,
             "documents_count": len(documents),
@@ -522,7 +515,6 @@ class PolizaNomina212BHandler:
         header_line: str,
         detail_lines: list[str],
         new_idext: str,
-        neto_glaccount: str | None = None,
     ) -> str:
         if not detail_lines:
             raise ValueError("No se puede construir TXT sin detalles para calcular NETO.")
@@ -553,32 +545,12 @@ class PolizaNomina212BHandler:
             new_idext=new_idext,
             amount=neto_signed_amount,
             posting_key=neto_posting_key,
-            neto_glaccount=neto_glaccount,
         )
 
         return "\n".join([new_header, *new_details, neto_line]) + "\n"
 
     def _is_neto_detail(self, line: str) -> bool:
         return line.startswith("D") and line[59:109].strip().upper() == "NETO"
-
-    def _extract_original_neto_glaccount(self, neto_detail_lines: list[str]) -> str:
-        """
-        Toma la cuenta contable del NETO original del archivo de entrada.
-
-        Ejemplo:
-            D...20700000...NETO...
-                 ^^^^^^^^
-        Esa cuenta debe conservarse en los NETO generados para cada TXT split.
-        """
-        for line in neto_detail_lines:
-            if len(line) >= 26:
-                glaccount = line[16:26].strip()
-                if glaccount:
-                    return glaccount
-
-        # Fallback histórico para no romper ejecuciones donde el archivo no
-        # traiga línea NETO de entrada.
-        return "215010"
 
     def _calculate_neto_amount(self, detail_lines: list[str]) -> Decimal:
         """
@@ -625,14 +597,12 @@ class PolizaNomina212BHandler:
         new_idext: str,
         amount: Decimal,
         posting_key: str,
-        neto_glaccount: str | None = None,
     ) -> str:
         """
         Genera la línea final NETO por documento.
 
         Reglas:
-            - Glaccount: se conserva la cuenta del NETO original del archivo.
-              Si no existe NETO original, usa 215010 como fallback.
+            - Glaccount fijo: 215010
             - Postingkey dinámico: 50 si NETO >= 0, 40 si NETO < 0
             - Importe siempre positivo
             - Texto fijo: NETO
@@ -643,11 +613,10 @@ class PolizaNomina212BHandler:
 
         amount_text = self._format_amount(amount)
         first_cost_center = template_detail_line[109:119].strip()
-        neto_account = str(neto_glaccount or "215010").strip() or "215010"
 
         return (
             line[:16]
-            + neto_account.ljust(10)[:10]
+            + "215010".ljust(10)[:10]
             + posting_key.ljust(2)[:2]
             + amount_text.ljust(13)[:13]
             + new_idext.ljust(18)[:18]
@@ -755,9 +724,23 @@ class PolizaNomina212BHandler:
         source_file: str,
         sociedad: str,
         trans_uuid: str,
+        postgres_conn_id: str | None = None,
+        apply_lookups: bool = False,
     ) -> list[dict[str, Any]]:
 
         polizas_by_idext: dict[str, dict[str, Any]] = {}
+
+        # Cache/preload para evitar 1 query por campo por línea.
+        # Con esto se hace 1 sola consulta por documento split para todos los
+        # FINANZAS-plan_de_cuentas-* y FINANZAS-ceco-cebe-* necesarios.
+        lookup_cache: dict[str, str | None] = {}
+        if apply_lookups:
+            if not postgres_conn_id:
+                raise ValueError("apply_lookups=True requiere postgres_conn_id")
+            lookup_cache = self._preload_lookup_cache_for_lines(
+                postgres_conn_id=postgres_conn_id,
+                lines=lines,
+            )
 
         for line in lines:
             item_type = line[0:1]
@@ -781,7 +764,15 @@ class PolizaNomina212BHandler:
                 polizas_by_idext[idext]["header"] = self._parse_header(line)
 
             elif item_type == "D":
-                polizas_by_idext[idext]["details"].append(self._parse_detail(line))
+                detail = self._parse_detail(line)
+
+                if apply_lookups:
+                    detail = self._apply_glaccount_costcenter_lookups(
+                        item=detail,
+                        lookup_cache=lookup_cache,
+                    )
+
+                polizas_by_idext[idext]["details"].append(detail)
 
             else:
                 raise ValueError(
@@ -842,6 +833,120 @@ class PolizaNomina212BHandler:
             "Reference3": line[156:].strip(),
             "raw": line,
         }
+
+    def _apply_glaccount_costcenter_lookups(
+        self,
+        item: dict[str, Any],
+        lookup_cache: dict[str, str | None],
+    ) -> dict[str, Any]:
+        """
+        Aplica lookups solo para ruta S4H.
+
+        Reglas heredadas de 1037/NiFi:
+        - Si Numberoflineitem == 1, Glaccount se fuerza a 3000326.
+        - Si Postingkey está en 40/50, Glaccount se busca en:
+          FINANZAS-plan_de_cuentas-{GlaccountOriginal}.
+        - Costcenter siempre se busca en:
+          FINANZAS-ceco-cebe-{CostcenterOriginal}.
+        - Si no existe target_value, se conserva el valor original.
+        """
+
+        gl_original = str(item.get("Glaccount", "")).strip()
+        posting_key = str(item.get("Postingkey", "")).strip()
+        numberoflineitem = self._safe_int(item.get("Numberoflineitem"))
+
+        item["GlaccountOriginal"] = gl_original
+
+        if numberoflineitem == 1:
+            item["GlaccountLookupKey"] = "NIFI_RULE_NUMBEROFITEM_EQUALS_1"
+            item["Glaccount"] = "3000326"
+
+        elif posting_key in ("40", "50"):
+            gl_key = f"FINANZAS-plan_de_cuentas-{gl_original}"
+            gl_value = lookup_cache.get(gl_key)
+
+            item["GlaccountLookupKey"] = gl_key
+            item["Glaccount"] = gl_value if gl_value is not None else gl_original
+
+        else:
+            item["GlaccountLookupKey"] = gl_original
+            item["Glaccount"] = gl_original
+
+        costcenter_original = str(item.get("Costcenter", "")).strip()
+        costcenter_key = f"FINANZAS-ceco-cebe-{costcenter_original}"
+        costcenter_value = lookup_cache.get(costcenter_key)
+
+        item["CostcenterOriginal"] = costcenter_original
+        item["CostcenterLookupKey"] = costcenter_key
+        item["Costcenter"] = (
+            costcenter_value if costcenter_value is not None else costcenter_original
+        )
+
+        return item
+
+    def _preload_lookup_cache_for_lines(
+        self,
+        postgres_conn_id: str,
+        lines: list[str],
+    ) -> dict[str, str | None]:
+        """
+        Carga en una sola consulta todos los lookups necesarios para líneas D.
+        Esto evita hacer 1 query por Glaccount/Costcenter de cada detalle.
+        """
+
+        lookup_keys: set[str] = set()
+
+        for line in lines:
+            if not line.startswith("D"):
+                continue
+
+            numberoflineitem = self._safe_int(line[13:16].strip())
+            gl_original = line[16:26].strip()
+            posting_key = line[26:28].strip()
+            costcenter_original = line[109:119].strip()
+
+            if numberoflineitem != 1 and posting_key in ("40", "50") and gl_original:
+                lookup_keys.add(f"FINANZAS-plan_de_cuentas-{gl_original}")
+
+            if costcenter_original:
+                lookup_keys.add(f"FINANZAS-ceco-cebe-{costcenter_original}")
+
+        if not lookup_keys:
+            return {}
+
+        hook = PostgresHook(postgres_conn_id=postgres_conn_id)
+
+        sql = """
+            SELECT lookupkey, target_value
+            FROM ctrlplane.tbl_cat_gd
+            WHERE lookupkey = ANY(%s)
+        """
+
+        keys_list = sorted(lookup_keys)
+        rows = hook.get_records(sql, parameters=(keys_list,))
+
+        cache: dict[str, str | None] = {key: None for key in keys_list}
+
+        for lookupkey, target_value in rows:
+            cache[str(lookupkey)] = (
+                str(target_value).strip() if target_value is not None else None
+            )
+
+        missing = [key for key, value in cache.items() if value is None]
+        if missing:
+            logging.warning(
+                "Lookups no encontrados en ctrlplane.tbl_cat_gd: %s",
+                missing[:50],
+            )
+
+        logging.info(
+            "Lookups precargados: solicitados=%s encontrados=%s faltantes=%s",
+            len(keys_list),
+            len(rows),
+            len(missing),
+        )
+
+        return cache
 
     def _lookup_global_dictionary(
         self,
